@@ -11,6 +11,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from sentence_transformers import SentenceTransformer
 import uvicorn
 import openai
+from ultralytics import YOLO
+import mediapipe as mp
+import cv2
+
+
+# Load a YOLO model (you can use a custom model or the official one if it has 'cell phone' class)
+# E.g., "yolov8n.pt" might already detect 'cell phone' or 'mobile phone' depending on the dataset
+model = YOLO("yolov8n.pt")
 
 app = FastAPI()
 
@@ -68,97 +76,74 @@ interview_config = {
     }
 }
 
-
-def generate_question(topic, conversation_history):
-    system_prompt = f"""You are a technical interviewer specializing in {topic['name']}.
-    Current difficulty level: {topic['current_level']}.
-    Ask 1 concise question. Never reveal answers.
-    Format: <question>||<expected_keywords>"""
-
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            *conversation_history
-        ]
-    )
-
-    # Split generated content into question and evaluation criteria
-    question, keywords = response.choices[0].message.content.split("||")
-    return question.strip(), [k.strip() for k in keywords.split(",")]
-
-
-# Load once during initialization
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+def detect_phone(frame):
+    """
+    Runs YOLO detection on the frame to see if a phone is present.
+    Returns True if phone is detected, otherwise False.
+    """
+    results = model.predict(source=frame, conf=0.3)  # adjust confidence threshold
+    # results is a list of 'ultralytics.yolo.engine.results.Results' for each image
+    
+    # If any detection is labeled as 'cell phone' or 'mobile phone', return True
+    # You need to check the class name or the class index for the phone label
+    for r in results:
+        for box in r.boxes:
+            class_id = int(box.cls[0])
+            label = model.names[class_id]
+            if label.lower() in ["cell phone", "mobile phone", "phone"]:  # adapt to your model
+                return True
+    return False
 
 
-def conduct_interview():
-    conversation_history = []
 
-    for topic in interview_config["topics"]:
-        questions_asked = 0
+mp_face_detection = mp.solutions.face_detection
+mp_drawing = mp.solutions.drawing_utils
 
-        while questions_asked < interview_config["rules"]["max_questions_per_topic"]:
-            # 1. Generate Question
-            question, expected_keywords = generate_question(topic, conversation_history)
+def detect_face(frame):
+    """
+    Returns True if at least one face is detected in the frame, otherwise False.
+    """
+    # Convert to RGB for MediaPipe
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    with mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5) as face_detect:
+        results = face_detect.process(rgb_frame)
+        if results.detections:
+            return True
+        else:
+            return False
+        
 
-            # 2. Get Candidate Response
-            answer = transcribe_audio("audio.mp3")  # Voice/text input
+# newly added - @akshay, purushottam
 
-            # 3. Evaluate Answer
-            answer_embedding = embedding_model.encode([answer])
-            keyword_embeddings = embedding_model.encode(expected_keywords)
-            similarity = max(cosine_similarity(answer_embedding, keyword_embeddings)[0])
-            is_correct = similarity > 0.65
+@socketio.on('video_frame')
+def handle_video_frame(data):
+    # data is base64 encoded image: "data:image/jpeg;base64,/9j/4AAQ..."
+    try:
+        # Split out the header if data URL
+        header, encoded = data.split(',', 1)
+        img_bytes = base64.b64decode(encoded)
+        np_arr = np.frombuffer(img_bytes, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        
+        # -- Face detection
+        face_detected = detect_face(frame)
 
-            # 4. Update Difficulty
-            if is_correct:
-                current_level_idx = interview_config["rules"]["difficulty_progression"].index(topic["current_level"])
-                if current_level_idx < len(interview_config["rules"]["difficulty_progression"]) - 1:
-                    topic["current_level"] = interview_config["rules"]["difficulty_progression"][current_level_idx + 1]
+        # -- Phone detection
+        phone_detected = detect_phone(frame)
 
-            # 5. Store Context
-            conversation_history.extend([
-                {"role": "assistant", "content": question},
-                {"role": "user", "content": answer}
-            ])
-
-            questions_asked += 1
-
-
-def generate_follow_up(conversation_history):
-    prompt = """Analyze this conversation and suggest 2-3 follow-up questions:
-    {history}
-
-    Format as:
-    1. <question1>
-    2. <question2>"""
-
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return parse_questions(response.choices[0].message.content)
-
-
-def calculate_score(topic, is_correct):
-    level_weights = {
-        "Basic": 1,
-        "Medium": 1.5,
-        "Advanced": 2
-    }
-    return level_weights[topic["current_level"]] * (1 if is_correct else 0.5)
+        # Emit results to client
+        socketio.emit('analysis', {
+            'face_detected': face_detected,
+            'phone_detected': phone_detected
+        })
+    except Exception as e:
+        print("Error in frame handling:", e)
+        socketio.emit('analysis', {
+            'face_detected': False,
+            'phone_detected': False
+        })
 
 
-def analyze_fluency(answer):
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{
-            "role": "system",
-            "content": f"Rate English fluency 1-10: {answer}\\nReturn ONLY a number."
-        }]
-    )
-    return int(response.choices[0].message.content)
 
 
 if __name__ == "__main__":
