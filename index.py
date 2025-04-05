@@ -4,6 +4,13 @@ import os
 from sklearn.metrics.pairwise import cosine_similarity
 # from torch.nn.functional import cosine_similarity
 # from torch import cosine_similarity
+
+import json
+import base64
+import cv2
+import numpy as np
+from fastapi import FastAPI, WebSocket
+from fastapi.responses import HTMLResponse
 from werkzeug.utils import secure_filename  # If using Flask
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
@@ -78,19 +85,15 @@ interview_config = {
 
 def detect_phone(frame):
     """
-    Runs YOLO detection on the frame to see if a phone is present.
-    Returns True if phone is detected, otherwise False.
+    Returns True if a phone is detected in the frame, otherwise False.
     """
-    results = model.predict(source=frame, conf=0.3)  # adjust confidence threshold
-    # results is a list of 'ultralytics.yolo.engine.results.Results' for each image
-    
-    # If any detection is labeled as 'cell phone' or 'mobile phone', return True
-    # You need to check the class name or the class index for the phone label
+    # Predict with some confidence threshold
+    results = model.predict(source=frame, conf=0.3)
     for r in results:
         for box in r.boxes:
             class_id = int(box.cls[0])
             label = model.names[class_id]
-            if label.lower() in ["cell phone", "mobile phone", "phone"]:  # adapt to your model
+            if label.lower() in ["cell phone", "mobile phone", "phone"]:
                 return True
     return False
 
@@ -103,46 +106,48 @@ def detect_face(frame):
     """
     Returns True if at least one face is detected in the frame, otherwise False.
     """
-    # Convert to RGB for MediaPipe
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     with mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5) as face_detect:
         results = face_detect.process(rgb_frame)
-        if results.detections:
-            return True
-        else:
-            return False
-        
+        return bool(results.detections)
 
 # newly added - @akshay, purushottam
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    # Accept WebSocket connection
+    await websocket.accept()
+    
+    while True:
+        try:
+            # Receive text data from the client
+            message = await websocket.receive_text()
+            msg_dict = json.loads(message)
 
-@socketio.on('video_frame')
-def handle_video_frame(data):
-    # data is base64 encoded image: "data:image/jpeg;base64,/9j/4AAQ..."
-    try:
-        # Split out the header if data URL
-        header, encoded = data.split(',', 1)
-        img_bytes = base64.b64decode(encoded)
-        np_arr = np.frombuffer(img_bytes, np.uint8)
-        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-        
-        # -- Face detection
-        face_detected = detect_face(frame)
+            if msg_dict["action"] == "video_frame":
+                # Extract base64 data
+                data_url = msg_dict["data"]  # data:image/jpeg;base64,/9j/4AAQ...
+                header, encoded = data_url.split(',', 1)
+                img_bytes = base64.b64decode(encoded)
+                np_arr = np.frombuffer(img_bytes, np.uint8)
+                frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-        # -- Phone detection
-        phone_detected = detect_phone(frame)
+                # Face detection
+                face_detected = detect_face(frame)
 
-        # Emit results to client
-        socketio.emit('analysis', {
-            'face_detected': face_detected,
-            'phone_detected': phone_detected
-        })
-    except Exception as e:
-        print("Error in frame handling:", e)
-        socketio.emit('analysis', {
-            'face_detected': False,
-            'phone_detected': False
-        })
+                # Phone detection
+                phone_detected = detect_phone(frame)
 
+                # Send analysis result back to client
+                response = {
+                    "action": "analysis",
+                    "face_detected": face_detected,
+                    "phone_detected": phone_detected
+                }
+                await websocket.send_text(json.dumps(response))
+
+        except Exception as e:
+            print("Error in WebSocket communication:", e)
+            break
 
 
 
